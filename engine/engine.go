@@ -9,6 +9,7 @@ package engine
 
 import (
 	"context"
+	"hash/fnv"
 	"time"
 )
 
@@ -16,11 +17,12 @@ import (
 type Reason string
 
 const (
-	ReasonSuccess Reason = "success"
-	ReasonFailure Reason = "failure"
-	ReasonDecay   Reason = "decay"
-	ReasonManual  Reason = "manual"
-	ReasonInitial Reason = "initial"
+	ReasonSuccess   Reason = "success"
+	ReasonFailure   Reason = "failure"
+	ReasonDecay     Reason = "decay"
+	ReasonManual    Reason = "manual"
+	ReasonInitial   Reason = "initial"
+	ReasonReplicate Reason = "replicate" // v0.8.0 M4-3: trust inherited from parent agent
 )
 
 // TrustPoint is a single historical record of a Trust Score change.
@@ -102,6 +104,28 @@ type Engine interface {
 	// Returns false for fresh agents (they are cold, not asleep — distinct concepts).
 	IsAsleep(ctx context.Context, agentName string) (bool, error)
 
+	// Replicate creates a child agent with inherited trust from parent (v0.8.0 M4-3).
+	//
+	// Semantics:
+	//   - childTrust = parentTrust * inheritanceFactor + jitter(±0.05, deterministic)
+	//   - clamped to [MinTrustScore, MaxTrustScore]
+	//   - parent trust is NOT modified (one-way inheritance)
+	//   - records history with ReasonReplicate on child
+	//
+	// Errors:
+	//   - ErrParentCold: parent has no trust data (caller should explore via
+	//     cold routing M4-1 first)
+	//   - ErrInvalidFactor: inheritanceFactor out of [0.0, 1.0]
+	//
+	// Caller responsibility:
+	//   - Use unique child agent IDs (Replicate overwrites any existing child trust)
+	//   - Verify parent trust ≥ MinParentTrustForReplication (0.8) before calling
+	//     — Engine does NOT enforce this, it is only a recommended floor.
+	//
+	// Returns: the actual computed child trust (after jitter + clamp), useful
+	// for caller logging / verification.
+	Replicate(ctx context.Context, parent, child string, inheritanceFactor float64) (float64, error)
+
 	// Write
 	RecordSuccess(ctx context.Context, agentName string, weight float64) error
 	RecordFailure(ctx context.Context, agentName string, weight float64) error
@@ -118,3 +142,60 @@ const (
 	MinTrustScore = 0.0
 	MaxTrustScore = 1.0
 )
+
+// ReplicateTrust parameters (v0.8.0 M4-3).
+//
+// Per design doc (2026-10-04-M3-neuroplasticity-subtask.md §4):
+//   - child trust = parent trust × inheritanceFactor ± jitter(0.05)
+//   - recommended parent trust ≥ 0.8 (only "高 trust" agents replicate)
+//   - jitter is deterministic from (parent, child) names — same inputs → same result
+const (
+	// DefaultInheritanceFactor is the default trust inheritance factor for Replicate.
+	// Per design doc:child trust = parent trust × 0.8 ± 0.05.
+	DefaultInheritanceFactor = 0.8
+
+	// MinParentTrustForReplication is the recommended minimum parent trust for
+	// Replicate. Engine does NOT enforce this — it is the caller's responsibility
+	// (e.g., wau-scheduler ReplicationPolicy checks this before calling Replicate).
+	MinParentTrustForReplication = 0.8
+
+	// replicateJitterRange is the ±range of deterministic jitter applied during
+	// Replicate. Final jitter = (hash(parent+child) → [0,1) - 0.5) * replicateJitterRange.
+	replicateJitterRange = 0.1
+)
+
+// ReplicateTrust computes child trust from parent (v0.8.0 M4-3 helper).
+//
+// Formula:
+//   childTrust = parentTrust * inheritanceFactor + jitter
+//   where jitter = (hash(parent+":"+child) → [0,1) - 0.5) * replicateJitterRange  // ±0.05
+//   final clamped to [MinTrustScore, MaxTrustScore]
+//
+// Use case: callers (e.g., kernel) want to compute the expected child trust
+// ahead of time for logging / decisioning, without calling Engine.Replicate.
+//
+// Determinism: same (parent, child, inheritanceFactor) → same result.
+// This makes the operation replay-safe and verifiable.
+//
+// Hash: FNV-1a 32-bit. Collision probability is negligible for the small
+// number of agents (single-digit thousands) in a typical WAU deployment.
+func ReplicateTrust(parentTrust, inheritanceFactor float64, parent, child string) float64 {
+	childTrust := parentTrust * inheritanceFactor
+
+	// Deterministic jitter from FNV-1a(parent+":"+child)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(parent))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(child))
+	jitterUnit := float64(h.Sum32()%10000) / 10000.0 // [0, 1)
+	jitter := (jitterUnit - 0.5) * replicateJitterRange
+	childTrust += jitter
+
+	if childTrust < MinTrustScore {
+		childTrust = MinTrustScore
+	}
+	if childTrust > MaxTrustScore {
+		childTrust = MaxTrustScore
+	}
+	return childTrust
+}

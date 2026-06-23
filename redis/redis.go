@@ -10,6 +10,7 @@ package redis
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -149,6 +150,73 @@ func (e *RedisEngine) IsAsleep(ctx context.Context, agentName string) (bool, err
 		return false, fmt.Errorf("trust: isAsleep check for %s: %w", agentName, err)
 	}
 	return n == 1, nil
+}
+
+// Replicate creates a child agent with trust inherited from parent (v0.8.0 M4-3).
+//
+// Implementation:
+//   - Pre-compute childTrust in Go via engine.ReplicateTrust() (deterministic,
+//     FNV-1a hash of parent+child). Same as MemoryEngine so behavior matches.
+//   - Use a Lua script to atomically: validate parent score exists (else
+//     PARENT_COLD error_reply), then SET child score.
+//   - Append history via XADD (best-effort after Lua succeeds).
+//
+// Concurrency: the Lua script provides atomicity for "validate parent + write
+// child" — concurrent Replicate calls on the same parent are serialized at
+// the Redis level. No cross-key locking needed.
+//
+// Overwrite behavior: child score is overwritten if it exists (consistent
+// with MemoryEngine). Caller responsibility: use unique child IDs.
+func (e *RedisEngine) Replicate(ctx context.Context, parent, child string, inheritanceFactor float64) (float64, error) {
+	if inheritanceFactor < 0 || inheritanceFactor > 1 {
+		return 0, engine.ErrInvalidFactor
+	}
+
+	// Atomic Lua: validate parent score exists, then SET child score.
+	// We pre-compute childTrust in Go (deterministic) and pass it to Lua —
+	// implementing FNV-1a + clamp inside Lua would be needlessly complex.
+	luaScript := redis.NewScript(`
+		local parent_key = KEYS[1]
+		local child_key = KEYS[2]
+		local child_trust = tonumber(ARGV[1])
+
+		local parent_score = redis.call('GET', parent_key)
+		if not parent_score then
+			return redis.error_reply("PARENT_COLD")
+		end
+
+		redis.call('SET', child_key, child_trust)
+		return tostring(child_trust)
+	`)
+
+	// Pre-compute child trust in Go (matches MemoryEngine behavior exactly)
+	parentScore, err := e.client.Get(ctx, e.scoreKey(parent)).Float64()
+	if err == redis.Nil {
+		return 0, engine.ErrParentCold
+	}
+	if err != nil {
+		return 0, fmt.Errorf("trust: replicate parent read %s: %w", parent, err)
+	}
+	childTrust := engine.ReplicateTrust(parentScore, inheritanceFactor, parent, child)
+
+	// Run Lua (validates parent again atomically + writes child)
+	_, err = luaScript.Run(ctx, e.client,
+		[]string{e.scoreKey(parent), e.scoreKey(child)},
+		childTrust,
+	).Result()
+	if err != nil {
+		// Lua returns PARENT_COLD as error_reply
+		if strings.Contains(err.Error(), "PARENT_COLD") {
+			return 0, engine.ErrParentCold
+		}
+		return 0, fmt.Errorf("trust: replicate %s -> %s: %w", parent, child, err)
+	}
+
+	// XADD history (best-effort, after score write succeeds)
+	_ = e.appendHistory(ctx, child, time.Now().UnixMilli(), engine.ReasonReplicate,
+		fmt.Sprintf("parent=%s inheritanceFactor=%f", parent, inheritanceFactor))
+
+	return childTrust, nil
 }
 
 // recordSignal is the internal EMA + history write.

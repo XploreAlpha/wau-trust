@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -176,8 +177,55 @@ func (m *MemoryEngine) Explain(ctx context.Context, agentName string) (TrustExpl
 	}, nil
 }
 
+// Replicate creates a child agent with trust inherited from parent (v0.8.0 M4-3).
+//
+// Implementation: MemoryEngine reuses the ReplicateTrust() helper to compute the
+// deterministic child score, then writes both score and history under the
+// child's key. Parent's state is untouched.
+//
+// Concurrency: holds m.mu.Lock() for the full read-modify-write to avoid
+// races with concurrent Replicate / RecordSuccess on the same parent.
+//
+// Overwrite behavior: if the child already has trust data (warm agent), its
+// score and history are overwritten. Caller responsibility: use unique child
+// IDs (the caller — typically WAU-core-kernel — generates child_agent_id
+// from parent_agent_id + suffix).
+func (m *MemoryEngine) Replicate(ctx context.Context, parent, child string, inheritanceFactor float64) (float64, error) {
+	if inheritanceFactor < 0 || inheritanceFactor > 1 {
+		return 0, ErrInvalidFactor
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	parentScore, ok := m.scores[parent]
+	if !ok {
+		return 0, ErrParentCold
+	}
+
+	childScore := ReplicateTrust(parentScore, inheritanceFactor, parent, child)
+
+	m.scores[child] = childScore
+	m.history[child] = append(m.history[child], TrustPoint{
+		Timestamp: time.Now(),
+		Score:     childScore,
+		Reason:    ReasonReplicate,
+		Detail:    fmt.Sprintf("parent=%s inheritanceFactor=%f", parent, inheritanceFactor),
+	})
+
+	return childScore, nil
+}
+
 // ErrInvalidWeight is returned when weight is out of [0, 1].
 var ErrInvalidWeight = &TrustError{Code: "INVALID_WEIGHT", Message: "weight must be in [0, 1]"}
+
+// ErrParentCold is returned by Replicate when the parent agent has no trust
+// data (v0.8.0 M4-3). Caller should explore the parent via cold routing (M4-1)
+// to accumulate some trust before retrying.
+var ErrParentCold = &TrustError{Code: "PARENT_COLD", Message: "parent has no trust data, explore via cold routing first"}
+
+// ErrInvalidFactor is returned by Replicate when inheritanceFactor is outside
+// [0.0, 1.0] (v0.8.0 M4-3).
+var ErrInvalidFactor = &TrustError{Code: "INVALID_FACTOR", Message: "inheritance factor must be in [0, 1]"}
 
 // TrustError is the error type for Trust Engine operations.
 type TrustError struct {

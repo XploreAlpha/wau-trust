@@ -39,6 +39,12 @@ func (e *RedisEngine) historyKey(agentName string) string {
 	return fmt.Sprintf("%strust:history:%s", e.prefix, agentName)
 }
 
+// asleepKey returns the Redis key marking the agent as asleep (v0.8.0 M4-2).
+// Existence of this key = agent is asleep; absence = awake (or cold).
+func (e *RedisEngine) asleepKey(agentName string) string {
+	return fmt.Sprintf("%strust:%s:asleep", e.prefix, agentName)
+}
+
 // GetScore returns the current Trust Score for an agent.
 // If the agent is not registered, returns engine.DefaultTrustScore.
 func (e *RedisEngine) GetScore(ctx context.Context, agentName string) (float64, error) {
@@ -91,15 +97,58 @@ func (e *RedisEngine) RecordFailure(ctx context.Context, agentName string, weigh
 //   - Before: Reset set score key to DefaultTrustScore (kept key)
 //   - After:  Reset deletes score key entirely
 // GetScore is unaffected — it returns DefaultTrustScore when key is absent.
+//
+// v0.8.0 M4-2: also clears the asleep flag (agent "reboots" = awake).
 func (e *RedisEngine) Reset(ctx context.Context, agentName string) error {
 	pipe := e.client.Pipeline()
 	pipe.Del(ctx, e.scoreKey(agentName))
 	pipe.Del(ctx, e.historyKey(agentName))
+	pipe.Del(ctx, e.asleepKey(agentName))
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("trust: reset %s: %w", agentName, err)
 	}
 	return nil
+}
+
+// Sleep marks the agent as asleep (v0.8.0 M4-2).
+//
+// Idempotent: setting the asleep key when it already exists is a no-op
+// (SET ... NX is used; returns nil if key exists).
+//
+// Convention: callers should check IsCold(agent) == false before calling
+// Sleep. Cold agents should first be explored via cold routing (M4-1).
+func (e *RedisEngine) Sleep(ctx context.Context, agentName string) error {
+	ok, err := e.client.SetNX(ctx, e.asleepKey(agentName), "1", 0).Result()
+	if err != nil {
+		return fmt.Errorf("trust: sleep %s: %w", agentName, err)
+	}
+	_ = ok // ok=false means already asleep, that's fine (idempotent)
+	return nil
+}
+
+// Wake reactivates an asleep agent (v0.8.0 M4-2).
+//
+// Idempotent: deleting a non-existent key returns 0 (no error in Redis).
+func (e *RedisEngine) Wake(ctx context.Context, agentName string) error {
+	_, err := e.client.Del(ctx, e.asleepKey(agentName)).Result()
+	if err != nil {
+		return fmt.Errorf("trust: wake %s: %w", agentName, err)
+	}
+	return nil
+}
+
+// IsAsleep reports whether the agent is currently asleep (v0.8.0 M4-2).
+//
+// Returns true when the asleep key exists (Sleep was called, Wake was not).
+// Returns false for fresh (cold) agents — they are not asleep, they have no
+// trust data at all. Sleep and Cold are distinct concepts.
+func (e *RedisEngine) IsAsleep(ctx context.Context, agentName string) (bool, error) {
+	n, err := e.client.Exists(ctx, e.asleepKey(agentName)).Result()
+	if err != nil {
+		return false, fmt.Errorf("trust: isAsleep check for %s: %w", agentName, err)
+	}
+	return n == 1, nil
 }
 
 // recordSignal is the internal EMA + history write.

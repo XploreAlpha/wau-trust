@@ -447,3 +447,195 @@ func TestMemoryEngine_Sleep_Wake_Concurrent(t *testing.T) {
 	}
 	t.Logf("final state: asleep=%v (both states are valid under concurrency)", asleep)
 }
+
+// ====================================================================
+// v0.8.0 M4-3.1: Replicate 原语测试
+// ====================================================================
+//
+// Replicate 接受 (parent, child, inheritanceFactor),返回 child trust。
+// 公式:child = parent × factor + jitter(±0.05, deterministic from FNV-1a(parent+child))
+// jitter 是 deterministic — 同 input 同 output。
+
+// TestMemoryEngine_Replicate_Basic: 基础流程 — parent=0.9 × factor=0.8 → child ∈ [0.67, 0.77]
+func TestMemoryEngine_Replicate_Basic(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// 建立 parent trust:用 weight=0.8 让 Whis 升到 0.9
+	// 公式:new = 0.5 * (1-0.8) + 1.0 * 0.8 = 0.5 * 0.2 + 0.8 = 0.1 + 0.8 = 0.9
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil {
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+	parentScore, _ := eng.GetScore(ctx, "Whis")
+	if parentScore != 0.9 {
+		t.Fatalf("precondition: parent should be 0.9, got %f", parentScore)
+	}
+
+	// Replicate with factor=0.8 → child = 0.9 × 0.8 = 0.72 ± 0.05 = [0.67, 0.77]
+	childScore, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+	if childScore < 0.67 || childScore > 0.77 {
+		t.Errorf("child score %f outside expected range [0.67, 0.77]", childScore)
+	}
+
+	// 验证 GetScore 也看到相同值
+	gotScore, _ := eng.GetScore(ctx, "Whis-jr")
+	if gotScore != childScore {
+		t.Errorf("GetScore(%f) != Replicate returned score (%f)", gotScore, childScore)
+	}
+}
+
+// TestMemoryEngine_Replicate_Deterministic: 同 input × 3 → 完全相同 output
+func TestMemoryEngine_Replicate_Deterministic(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil { // 0.9
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+
+	// 多次 Replicate 同一对(parent, child, factor)
+	score1, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != nil {
+		t.Fatalf("first Replicate: %v", err)
+	}
+	score2, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != nil {
+		t.Fatalf("second Replicate: %v", err)
+	}
+	score3, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != nil {
+		t.Fatalf("third Replicate: %v", err)
+	}
+
+	if score1 != score2 || score2 != score3 {
+		t.Errorf("expected deterministic, got %f, %f, %f", score1, score2, score3)
+	}
+}
+
+// TestMemoryEngine_Replicate_ParentUnchanged: Replicate 后 parent trust 不变
+func TestMemoryEngine_Replicate_ParentUnchanged(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil { // 0.9
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+	parentBefore, _ := eng.GetScore(ctx, "Whis")
+
+	if _, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8); err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+
+	parentAfter, _ := eng.GetScore(ctx, "Whis")
+	if parentAfter != parentBefore {
+		t.Errorf("parent score changed: before=%f, after=%f", parentBefore, parentAfter)
+	}
+}
+
+// TestMemoryEngine_Replicate_ParentCold_Err: parent 是 fresh agent(cold) → ErrParentCold
+func TestMemoryEngine_Replicate_ParentCold_Err(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	// 不 RecordSuccess,parent 保持 cold
+
+	_, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != engine.ErrParentCold {
+		t.Errorf("expected ErrParentCold, got %v", err)
+	}
+}
+
+// TestMemoryEngine_Replicate_InvalidFactor: factor 越界 → ErrInvalidFactor
+func TestMemoryEngine_Replicate_InvalidFactor(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil {
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+
+	// factor < 0
+	if _, err := eng.Replicate(ctx, "Whis", "Whis-jr", -0.1); err != engine.ErrInvalidFactor {
+		t.Errorf("expected ErrInvalidFactor for factor=-0.1, got %v", err)
+	}
+	// factor > 1
+	if _, err := eng.Replicate(ctx, "Whis", "Whis-jr", 1.5); err != engine.ErrInvalidFactor {
+		t.Errorf("expected ErrInvalidFactor for factor=1.5, got %v", err)
+	}
+
+	// boundary: factor = 0 和 factor = 1 都合法
+	if _, err := eng.Replicate(ctx, "Whis", "child-0", 0.0); err != nil {
+		t.Errorf("factor=0 should be valid, got %v", err)
+	}
+	if _, err := eng.Replicate(ctx, "Whis", "child-1", 1.0); err != nil {
+		t.Errorf("factor=1 should be valid, got %v", err)
+	}
+}
+
+// TestMemoryEngine_Replicate_RecordsHistory: child history 含 ReasonReplicate
+func TestMemoryEngine_Replicate_RecordsHistory(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil {
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+
+	if _, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8); err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+
+	history, err := eng.GetHistory(ctx, "Whis-jr", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("GetHistory: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("expected 1 history point, got %d", len(history))
+	}
+	if history[0].Reason != engine.ReasonReplicate {
+		t.Errorf("expected ReasonReplicate, got %s", history[0].Reason)
+	}
+}
+
+// TestMemoryEngine_Replicate_ExistingChild_Overwrite: 已 warm 的 child 被 Replicate 覆盖
+// 注意:Replicate 只覆盖 score,history 是 append-only(类比 RecordSuccess)。
+// 期望:history 有 11 条(10 failure + 1 replicate),score 被覆盖为 parent × factor。
+func TestMemoryEngine_Replicate_ExistingChild_Overwrite(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil { // 0.9
+		t.Fatalf("RecordSuccess Whis: %v", err)
+	}
+
+	// child 已经有 trust(用 RecordFailure 把分数拉到 0)
+	childName := "shared-child"
+	for i := 0; i < 10; i++ {
+		_ = eng.RecordFailure(ctx, childName, 0.5)
+	}
+	preReplicateScore, _ := eng.GetScore(ctx, childName)
+	if preReplicateScore >= 0.5 {
+		t.Fatalf("precondition: child should have low score before Replicate, got %f", preReplicateScore)
+	}
+
+	// 现在 Replicate(0.9 × 0.8 ≈ 0.72)覆盖 child 的 score
+	childScore, err := eng.Replicate(ctx, "Whis", childName, 0.8)
+	if err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+	if childScore < 0.67 || childScore > 0.77 {
+		t.Errorf("child score %f outside expected range [0.67, 0.77]", childScore)
+	}
+
+	// score 已被覆盖
+	postReplicateScore, _ := eng.GetScore(ctx, childName)
+	if postReplicateScore != childScore {
+		t.Errorf("score not overwritten: got %f, want %f", postReplicateScore, childScore)
+	}
+
+	// history 应有 11 条(10 failure + 1 replicate),最后一条是 Replicate
+	history, _ := eng.GetHistory(ctx, childName, 1*time.Hour)
+	if len(history) != 11 {
+		t.Errorf("expected 11 history points (10 failure + 1 replicate), got %d", len(history))
+	}
+	if history[len(history)-1].Reason != engine.ReasonReplicate {
+		t.Errorf("expected last history entry ReasonReplicate, got %s", history[len(history)-1].Reason)
+	}
+}

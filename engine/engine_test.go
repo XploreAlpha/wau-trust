@@ -270,3 +270,180 @@ func TestMemoryEngine_IsCold_Concurrent(t *testing.T) {
 		t.Error("expected agent with 50 concurrent records to be warm")
 	}
 }
+
+// ====================================================================
+// v0.8.0 M4-2: Sleep / Wake / IsAsleep tests
+// ====================================================================
+
+// TestMemoryEngine_Sleep_Wake_Basic: 基础 sleep → wake 流程
+func TestMemoryEngine_Sleep_Wake_Basic(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// 0. 初始:fresh agent 不睡(M4-2.2 policy 才会 sleep;这里只测原语)
+	asleep, err := eng.IsAsleep(ctx, "Whis")
+	if err != nil {
+		t.Fatalf("IsAsleep: %v", err)
+	}
+	if asleep {
+		t.Error("fresh agent should NOT be asleep (no sleep call yet)")
+	}
+
+	// 1. Sleep(无 trust 数据 — caller 责任不调,但 MemoryEngine 不强制)
+	if err := eng.Sleep(ctx, "Whis"); err != nil {
+		t.Fatalf("Sleep: %v", err)
+	}
+	asleep, _ = eng.IsAsleep(ctx, "Whis")
+	if !asleep {
+		t.Error("expected agent to be asleep after Sleep")
+	}
+
+	// 2. Wake
+	if err := eng.Wake(ctx, "Whis"); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	asleep, _ = eng.IsAsleep(ctx, "Whis")
+	if asleep {
+		t.Error("expected agent to be awake after Wake")
+	}
+}
+
+// TestMemoryEngine_Sleep_Idempotent: 重 Sleep 已睡 agent 不报错
+func TestMemoryEngine_Sleep_Idempotent(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	if err := eng.Sleep(ctx, "Whis"); err != nil {
+		t.Fatalf("first Sleep: %v", err)
+	}
+	// 重 Sleep — 应当 no-op 不报错
+	if err := eng.Sleep(ctx, "Whis"); err != nil {
+		t.Fatalf("second Sleep should be idempotent, got: %v", err)
+	}
+	asleep, _ := eng.IsAsleep(ctx, "Whis")
+	if !asleep {
+		t.Error("expected agent to still be asleep after second Sleep")
+	}
+}
+
+// TestMemoryEngine_Wake_Idempotent: Wake 未睡 agent 不报错
+func TestMemoryEngine_Wake_Idempotent(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// Wake 一个未睡的 agent — 应当 no-op 不报错
+	if err := eng.Wake(ctx, "Whis"); err != nil {
+		t.Fatalf("Wake on awake agent should be idempotent, got: %v", err)
+	}
+	asleep, _ := eng.IsAsleep(ctx, "Whis")
+	if asleep {
+		t.Error("agent should still be awake")
+	}
+}
+
+// TestMemoryEngine_Sleep_DistinctFromCold: Sleep 和 Cold 是两个独立概念
+func TestMemoryEngine_Sleep_DistinctFromCold(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// fresh agent:cold=true, asleep=false
+	cold, _ := eng.IsCold(ctx, "Whis")
+	asleep, _ := eng.IsAsleep(ctx, "Whis")
+	if !cold {
+		t.Error("fresh agent should be cold")
+	}
+	if asleep {
+		t.Error("fresh agent should NOT be asleep (sleep not called yet)")
+	}
+
+	// Record 之后:cold=false, asleep=false(warm + awake)
+	_ = eng.RecordSuccess(ctx, "Whis", 0.1)
+	cold, _ = eng.IsCold(ctx, "Whis")
+	asleep, _ = eng.IsAsleep(ctx, "Whis")
+	if cold {
+		t.Error("warm agent should not be cold")
+	}
+	if asleep {
+		t.Error("warm agent should not be asleep without Sleep call")
+	}
+
+	// Sleep 之后:cold=false, asleep=true(warm + asleep)
+	_ = eng.Sleep(ctx, "Whis")
+	cold, _ = eng.IsCold(ctx, "Whis")
+	asleep, _ = eng.IsAsleep(ctx, "Whis")
+	if cold {
+		t.Error("warm agent should not be cold after Sleep")
+	}
+	if !asleep {
+		t.Error("expected agent to be asleep after Sleep")
+	}
+}
+
+// TestMemoryEngine_Reset_ClearsAsleep: Reset 清 sleep 状态(agent 重启 = awake)
+func TestMemoryEngine_Reset_ClearsAsleep(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	_ = eng.RecordSuccess(ctx, "Whis", 0.1) // 建立 trust 数据
+	_ = eng.Sleep(ctx, "Whis")              // 入睡
+	asleep, _ := eng.IsAsleep(ctx, "Whis")
+	if !asleep {
+		t.Fatal("setup: agent should be asleep")
+	}
+
+	// Reset 同时清 trust 数据 + asleep 标记
+	if err := eng.Reset(ctx, "Whis"); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	asleep, _ = eng.IsAsleep(ctx, "Whis")
+	if asleep {
+		t.Error("expected agent to be awake after Reset (reboots = awake)")
+	}
+	cold, _ := eng.IsCold(ctx, "Whis")
+	if !cold {
+		t.Error("expected agent to be cold after Reset (M4-1.1 alignment)")
+	}
+}
+
+// TestMemoryEngine_Sleep_AfterReset: Reset 后可重新 Sleep(无残留)
+func TestMemoryEngine_Sleep_AfterReset(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	_ = eng.RecordSuccess(ctx, "Whis", 0.1)
+	_ = eng.Sleep(ctx, "Whis")
+	_ = eng.Reset(ctx, "Whis")
+
+	// 重新 Record + Sleep(模拟 agent 上线后又下线)
+	_ = eng.RecordSuccess(ctx, "Whis", 0.1)
+	if err := eng.Sleep(ctx, "Whis"); err != nil {
+		t.Fatalf("Sleep after Reset: %v", err)
+	}
+	asleep, _ := eng.IsAsleep(ctx, "Whis")
+	if !asleep {
+		t.Error("expected agent to be asleep after re-Sleep")
+	}
+}
+
+// TestMemoryEngine_Sleep_Wake_Concurrent: 并发 Sleep + Wake 不破坏状态一致性
+func TestMemoryEngine_Sleep_Wake_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+	_ = eng.RecordSuccess(ctx, "Whis", 0.1) // 建立 trust
+
+	var wg sync.WaitGroup
+	// 25 Sleep + 25 Wake 并发
+	for i := 0; i < 25; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = eng.Sleep(ctx, "Whis") }()
+		go func() { defer wg.Done(); _ = eng.Wake(ctx, "Whis") }()
+	}
+	wg.Wait()
+
+	// 状态应是确定的(asleep 或 awake),不应 panic 或死锁
+	asleep, err := eng.IsAsleep(ctx, "Whis")
+	if err != nil {
+		t.Fatalf("IsAsleep after concurrent: %v", err)
+	}
+	t.Logf("final state: asleep=%v (both states are valid under concurrency)", asleep)
+}

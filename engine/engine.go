@@ -73,6 +73,35 @@ type Engine interface {
 	// GetScore alone cannot do (both return DefaultTrustScore = 0.5).
 	IsCold(ctx context.Context, agentName string) (bool, error)
 
+	// Sleep marks an agent as asleep (v0.8.0 M4-2).
+	//
+	// Convention: callers (e.g. wau-scheduler SleepPolicy) should check
+	// IsCold(agent) == false before calling Sleep. Cold agents (no trust
+	// data) should first be explored via cold routing (v0.8.0 M4-1).
+	// This method does NOT enforce the cold-check itself — it just sets the flag.
+	//
+	// Side effect: while asleep, the agent should NOT be scheduled by
+	// wau-scheduler. The Sleep/Wake/IsAsleep primitives are state flags;
+	// the actual scheduling skip is enforced by wau-scheduler (M4-2.2).
+	//
+	// Idempotent: calling Sleep on an already-asleep agent is a no-op (no error).
+	//
+	// Reset interaction: Reset clears the sleep flag (agent "reboots" = awake).
+	Sleep(ctx context.Context, agentName string) error
+
+	// Wake reactivates an asleep agent (v0.8.0 M4-2).
+	//
+	// Trigger: wau-scheduler demand spike (queue depth > threshold) selects
+	// the highest-trust asleep agent to Wake. Idempotent: calling Wake on
+	// an already-awake agent is a no-op (no error).
+	Wake(ctx context.Context, agentName string) error
+
+	// IsAsleep reports whether the agent is currently asleep (v0.8.0 M4-2).
+	//
+	// Returns true when Sleep has been called and Wake has not been called since.
+	// Returns false for fresh agents (they are cold, not asleep — distinct concepts).
+	IsAsleep(ctx context.Context, agentName string) (bool, error)
+
 	// Write
 	RecordSuccess(ctx context.Context, agentName string, weight float64) error
 	RecordFailure(ctx context.Context, agentName string, weight float64) error

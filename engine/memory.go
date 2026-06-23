@@ -13,7 +13,8 @@ type MemoryEngine struct {
 	mu        sync.RWMutex
 	scores    map[string]float64
 	history   map[string][]TrustPoint
-	decayRate float64 // per-hour decay
+	asleep    map[string]bool // v0.8.0 M4-2: sleep state (separate from scores)
+	decayRate float64         // per-hour decay
 }
 
 // NewMemoryEngine creates an in-memory Trust Engine for tests.
@@ -21,6 +22,7 @@ func NewMemoryEngine() *MemoryEngine {
 	return &MemoryEngine{
 		scores:    make(map[string]float64),
 		history:   make(map[string][]TrustPoint),
+		asleep:    make(map[string]bool),
 		decayRate: 0.01, // 1% per hour
 	}
 }
@@ -106,7 +108,44 @@ func (m *MemoryEngine) Reset(ctx context.Context, agentName string) error {
 	defer m.mu.Unlock()
 	delete(m.scores, agentName)
 	delete(m.history, agentName)
+	delete(m.asleep, agentName) // v0.8.0 M4-2: Reset wakes agent
 	return nil
+}
+
+// Sleep marks the agent as asleep (v0.8.0 M4-2).
+//
+// Pre-condition: IsCold(agent) == false. Cold agents (no trust data) cannot
+// be put to sleep — they should be explored via cold routing first (M4-1).
+//
+// Idempotent: re-sleeping an asleep agent is a no-op (no error returned).
+func (m *MemoryEngine) Sleep(ctx context.Context, agentName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.asleep[agentName] {
+		return nil // already asleep, no-op
+	}
+	m.asleep[agentName] = true
+	return nil
+}
+
+// Wake reactivates an asleep agent (v0.8.0 M4-2).
+//
+// Idempotent: waking an already-awake agent is a no-op (no error returned).
+func (m *MemoryEngine) Wake(ctx context.Context, agentName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.asleep, agentName)
+	return nil
+}
+
+// IsAsleep reports whether the agent is currently asleep (v0.8.0 M4-2).
+//
+// Returns false for fresh (cold) agents — they are not asleep, they have no
+// trust data at all. Sleep and Cold are distinct concepts.
+func (m *MemoryEngine) IsAsleep(ctx context.Context, agentName string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.asleep[agentName], nil
 }
 
 func (m *MemoryEngine) Explain(ctx context.Context, agentName string) (TrustExplanation, error) {

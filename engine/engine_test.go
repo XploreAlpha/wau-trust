@@ -166,3 +166,107 @@ func TestMemoryEngine_Concurrent(t *testing.T) {
 		t.Errorf("concurrent updates broke bounds: %f", score)
 	}
 }
+
+// ============== IsCold 测试 (v0.8.0 M4-1) ==============
+//
+// IsCold 区分"从未被 Record 过"(cold) vs "Record 过但当前是 DefaultTrustScore"(warm)。
+// GetScore 永远对两者都返回 0.5 — IsCold 是唯一能区分的信号。
+
+// TestMemoryEngine_IsCold_FreshAgent: 完全 fresh 的 agent → IsCold=true
+func TestMemoryEngine_IsCold_FreshAgent(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	cold, err := eng.IsCold(ctx, "new-agent")
+	if err != nil {
+		t.Fatalf("IsCold: %v", err)
+	}
+	if !cold {
+		t.Error("expected fresh agent to be cold, got false")
+	}
+}
+
+// TestMemoryEngine_IsCold_AfterRecordSuccess: RecordSuccess 后 → IsCold=false
+func TestMemoryEngine_IsCold_AfterRecordSuccess(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	if err := eng.RecordSuccess(ctx, "Whis", 0.1); err != nil {
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+
+	cold, err := eng.IsCold(ctx, "Whis")
+	if err != nil {
+		t.Fatalf("IsCold: %v", err)
+	}
+	if cold {
+		t.Error("expected agent with history to be warm (IsCold=false), got true")
+	}
+}
+
+// TestMemoryEngine_IsCold_AfterRecordFailure: RecordFailure 后 → IsCold=false
+// (即使 trust 分数降得很低,有失败记录也算 warm)
+func TestMemoryEngine_IsCold_AfterRecordFailure(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	if err := eng.RecordFailure(ctx, "Whis", 0.5); err != nil {
+		t.Fatalf("RecordFailure: %v", err)
+	}
+
+	cold, err := eng.IsCold(ctx, "Whis")
+	if err != nil {
+		t.Fatalf("IsCold: %v", err)
+	}
+	if cold {
+		t.Error("expected agent with failure history to be warm, got true")
+	}
+}
+
+// TestMemoryEngine_IsCold_AfterReset: Reset 后 → IsCold=true (重置 = 抹掉历史)
+// 这是关键 edge case:Reset 不算"有数据",跟"从未 Record"等价。
+func TestMemoryEngine_IsCold_AfterReset(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	_ = eng.RecordSuccess(ctx, "Whis", 0.1)
+	if cold, _ := eng.IsCold(ctx, "Whis"); cold {
+		t.Fatal("precondition: agent should be warm after RecordSuccess")
+	}
+
+	if err := eng.Reset(ctx, "Whis"); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	cold, err := eng.IsCold(ctx, "Whis")
+	if err != nil {
+		t.Fatalf("IsCold: %v", err)
+	}
+	if !cold {
+		t.Error("expected reset agent to be cold again, got false")
+	}
+}
+
+// TestMemoryEngine_IsCold_Concurrent: 并发 Record 不会破坏 IsCold 一致性
+func TestMemoryEngine_IsCold_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = eng.RecordSuccess(ctx, "Whis", 0.01)
+		}()
+	}
+	wg.Wait()
+
+	cold, err := eng.IsCold(ctx, "Whis")
+	if err != nil {
+		t.Fatalf("IsCold: %v", err)
+	}
+	if cold {
+		t.Error("expected agent with 50 concurrent records to be warm")
+	}
+}

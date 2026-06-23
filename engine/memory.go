@@ -34,6 +34,21 @@ func (m *MemoryEngine) GetScore(ctx context.Context, agentName string) (float64,
 	return DefaultTrustScore, nil
 }
 
+// IsCold reports whether the agent has no trust history (v0.8.0 M4-1).
+//
+// Implementation: MemoryEngine uses a `scores` map keyed by agentName.
+// If the key does not exist (never had Record/Reset called), the agent is cold.
+// If the key exists (even with DefaultTrustScore from Reset), it has data → not cold.
+//
+// Note: Reset() deletes the key, so a reset agent is cold again — this is
+// intentional (cold means "no data", reset clears all data).
+func (m *MemoryEngine) IsCold(ctx context.Context, agentName string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, exists := m.scores[agentName]
+	return !exists, nil
+}
+
 func (m *MemoryEngine) RecordSuccess(ctx context.Context, agentName string, weight float64) error {
 	return m.record(ctx, agentName, weight, 1.0, ReasonSuccess)
 }

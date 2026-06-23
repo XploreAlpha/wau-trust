@@ -29,6 +29,7 @@ type Engine interface {
     GetScore(ctx context.Context, agentName string) (float64, error)
     GetHistory(ctx context.Context, agentName string, window time.Duration) ([]TrustPoint, error)
     Explain(ctx context.Context, agentName string) (TrustExplanation, error)
+    IsCold(ctx context.Context, agentName string) (bool, error) // v0.8.0 M4-1
 
     // Write
     RecordSuccess(ctx context.Context, agentName string, weight float64) error
@@ -42,6 +43,9 @@ const DefaultTrustScore = 0.5
 const MinTrustScore = 0.0
 const MaxTrustScore = 1.0
 ```
+
+**v0.8.0 M4-1 新增 `IsCold`**:区分"fresh agent 无数据"(cold)vs"已 Record 过"(warm)。
+`GetScore` 对两者都返 0.5,`IsCold` 是冷路由(wau-scheduler M4-1.3)的唯一信号。
 
 ## 仓库结构
 

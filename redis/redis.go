@@ -52,6 +52,23 @@ func (e *RedisEngine) GetScore(ctx context.Context, agentName string) (float64, 
 	return val, nil
 }
 
+// IsCold reports whether the agent has no trust history (v0.8.0 M4-1).
+//
+// Implementation: uses EXISTS on `trust:{name}` to check if any score
+// has ever been recorded. EXISTS is O(1) in Redis, cheaper than GET+parse.
+// If the key does not exist → cold (no Record call ever, or Reset was called).
+//
+// Reset semantics (v0.8.0 M4-1): Reset() now deletes the score key entirely
+// (changed from v0.7.x where it set to DefaultTrustScore), so a reset agent
+// returns IsCold=true — semantically aligned with MemoryEngine.
+func (e *RedisEngine) IsCold(ctx context.Context, agentName string) (bool, error) {
+	n, err := e.client.Exists(ctx, e.scoreKey(agentName)).Result()
+	if err != nil {
+		return false, fmt.Errorf("trust: exists check for %s: %w", agentName, err)
+	}
+	return n == 0, nil
+}
+
 // RecordSuccess updates the Trust Score using EMA.
 // Final score = current * (1 - weight) + 1.0 * weight
 // Caller is expected to bound weight ∈ [0.0, 1.0].
@@ -66,10 +83,17 @@ func (e *RedisEngine) RecordFailure(ctx context.Context, agentName string, weigh
 	return e.recordSignal(ctx, agentName, weight, 0.0, engine.ReasonFailure, "")
 }
 
-// Reset clears the Trust Score to DefaultTrustScore and wipes history.
+// Reset clears ALL trust data for the agent: deletes both the score key
+// and the history stream (v0.8.0 M4-1: aligned with MemoryEngine.Reset so
+// IsCold returns true post-reset).
+//
+// Behavior change from v0.7.x:
+//   - Before: Reset set score key to DefaultTrustScore (kept key)
+//   - After:  Reset deletes score key entirely
+// GetScore is unaffected — it returns DefaultTrustScore when key is absent.
 func (e *RedisEngine) Reset(ctx context.Context, agentName string) error {
 	pipe := e.client.Pipeline()
-	pipe.Set(ctx, e.scoreKey(agentName), engine.DefaultTrustScore, 0)
+	pipe.Del(ctx, e.scoreKey(agentName))
 	pipe.Del(ctx, e.historyKey(agentName))
 	_, err := pipe.Exec(ctx)
 	if err != nil {

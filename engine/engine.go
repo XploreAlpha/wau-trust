@@ -59,6 +59,20 @@ type Engine interface {
 	GetHistory(ctx context.Context, agentName string, window time.Duration) ([]TrustPoint, error)
 	Explain(ctx context.Context, agentName string) (TrustExplanation, error)
 
+	// IsCold reports whether the agent has NO trust history (v0.8.0 M4-1).
+	//
+	// Returns true when:
+	//   - The agent has never had RecordSuccess / RecordFailure / Reset called on it
+	//
+	// Returns false when:
+	//   - At least one RecordSuccess / RecordFailure / Reset has been applied
+	//     (even if the resulting score is the DefaultTrustScore after Reset)
+	//
+	// This lets callers (e.g. wau-scheduler cold routing) distinguish
+	// "fresh agent, no data" from "neutral trust, has data", which
+	// GetScore alone cannot do (both return DefaultTrustScore = 0.5).
+	IsCold(ctx context.Context, agentName string) (bool, error)
+
 	// Write
 	RecordSuccess(ctx context.Context, agentName string, weight float64) error
 	RecordFailure(ctx context.Context, agentName string, weight float64) error

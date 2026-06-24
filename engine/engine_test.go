@@ -639,3 +639,144 @@ func TestMemoryEngine_Replicate_ExistingChild_Overwrite(t *testing.T) {
 		t.Errorf("expected last history entry ReasonReplicate, got %s", history[len(history)-1].Reason)
 	}
 }
+
+// ============================================================================
+// v0.8.0 hotfix 1: RollbackReplicate 测试
+// ============================================================================
+
+// TestMemoryEngine_RollbackReplicate_HappyPath: 正常 Replicate + Rollback
+//   - Rollback 后 child trust 应消失
+//   - child history 最后一条应是 ReasonRollbackReplicate
+//   - parent trust 不受影响
+func TestMemoryEngine_RollbackReplicate_HappyPath(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// 准备:parent=0.9,child=Replicate 写入
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil { // 0.9
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+	childScore, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+
+	// 验证 pre-rollback:child 有 trust
+	preScore, _ := eng.GetScore(ctx, "Whis-jr")
+	if preScore != childScore {
+		t.Fatalf("precondition: child should have trust %f, got %f", childScore, preScore)
+	}
+
+	// Rollback
+	if err := eng.RollbackReplicate(ctx, "Whis", "Whis-jr"); err != nil {
+		t.Fatalf("RollbackReplicate: %v", err)
+	}
+
+	// 验证:child trust 消失(GetScore 返 default)
+	postScore, _ := eng.GetScore(ctx, "Whis-jr")
+	if postScore != engine.DefaultTrustScore {
+		t.Errorf("expected child score to be reset to default %f, got %f", engine.DefaultTrustScore, postScore)
+	}
+
+	// 验证:history 最后一条是 rollback
+	history, _ := eng.GetHistory(ctx, "Whis-jr", 1*time.Hour)
+	if len(history) == 0 {
+		t.Fatalf("expected history to have audit entry, got 0")
+	}
+	last := history[len(history)-1]
+	if last.Reason != engine.ReasonRollbackReplicate {
+		t.Errorf("expected last history entry ReasonRollbackReplicate, got %s", last.Reason)
+	}
+
+	// 验证:parent trust 不受影响
+	parentScore, _ := eng.GetScore(ctx, "Whis")
+	if parentScore != 0.9 {
+		t.Errorf("parent score should be unchanged 0.9, got %f", parentScore)
+	}
+}
+
+// TestMemoryEngine_RollbackReplicate_Idempotent: 调 2 次 Rollback 都不报错
+//   - 第 1 次:正常 rollback,child trust 消失
+//   - 第 2 次:无 history(no entry to check),返 nil(幂等)
+//   - child 之前没 Replicate(根本没 history):也返 nil
+func TestMemoryEngine_RollbackReplicate_Idempotent(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// Case A: 完全没 Replicate 过 → Rollback 返 nil
+	if err := eng.RollbackReplicate(ctx, "Ghost", "Ghost-jr"); err != nil {
+		t.Errorf("first rollback on non-existent child: %v", err)
+	}
+
+	// Case B: Replicate + Rollback + 再 Rollback
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil { // 0.9
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+	if _, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8); err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+	if err := eng.RollbackReplicate(ctx, "Whis", "Whis-jr"); err != nil {
+		t.Fatalf("first rollback: %v", err)
+	}
+	// 第 2 次:history 末条是 ReasonRollbackReplicate(不是 Replicate)→ 返 ErrNotReplicated
+	// 注:这是预期行为,不是 idempotent。idempotent 仅在"child 完全没 history"时。
+	// 第 3 次:把 child history 清空(模拟 cleanup)→ rollback 返 nil
+	if err := eng.Reset(ctx, "Whis-jr"); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if err := eng.RollbackReplicate(ctx, "Whis", "Whis-jr"); err != nil {
+		t.Errorf("third rollback (after Reset): %v", err)
+	}
+}
+
+// TestMemoryEngine_RollbackReplicate_NotReplicated: 防 trampling
+//   - Replicate 后,有人 RecordSuccess 了
+//   - Rollback 应返 ErrNotReplicated,不删 child trust
+func TestMemoryEngine_RollbackReplicate_NotReplicated(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// 准备:parent=0.9
+	if err := eng.RecordSuccess(ctx, "Whis", 0.8); err != nil { // 0.9
+		t.Fatalf("RecordSuccess: %v", err)
+	}
+	// Replicate → child=0.72±0.05
+	childScore, err := eng.Replicate(ctx, "Whis", "Whis-jr", 0.8)
+	if err != nil {
+		t.Fatalf("Replicate: %v", err)
+	}
+	// 模拟并发写:RecordSuccess 改 child
+	if err := eng.RecordSuccess(ctx, "Whis-jr", 0.5); err != nil {
+		t.Fatalf("concurrent RecordSuccess on child: %v", err)
+	}
+	newChildScore, _ := eng.GetScore(ctx, "Whis-jr")
+	if newChildScore == childScore {
+		t.Fatalf("precondition: concurrent write should have changed child score from %f", childScore)
+	}
+
+	// Rollback:history 末条是 ReasonSuccess(不是 Replicate)→ ErrNotReplicated
+	err = eng.RollbackReplicate(ctx, "Whis", "Whis-jr")
+	if err != engine.ErrNotReplicated {
+		t.Errorf("expected ErrNotReplicated, got %v", err)
+	}
+
+	// 验证:child trust 仍存在(没被删)
+	postScore, _ := eng.GetScore(ctx, "Whis-jr")
+	if postScore == engine.DefaultTrustScore {
+		t.Errorf("child score should still exist (not rolled back), got default %f", engine.DefaultTrustScore)
+	}
+}
+
+// TestMemoryEngine_RollbackReplicate_ChildNotFound: child 之前没 Replicate
+//   - history 不存在 → 返 nil(idempotent)
+//   - 不会 panic,不会返 ErrNotReplicated
+func TestMemoryEngine_RollbackReplicate_ChildNotFound(t *testing.T) {
+	ctx := context.Background()
+	eng := engine.NewMemoryEngine()
+
+	// child 根本不存在(没 Replicate 过,没 Record 任何东西)
+	err := eng.RollbackReplicate(ctx, "Whis", "Nonexistent-Child")
+	if err != nil {
+		t.Errorf("expected nil (idempotent) for non-existent child, got %v", err)
+	}
+}

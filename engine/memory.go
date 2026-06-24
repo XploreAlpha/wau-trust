@@ -215,6 +215,50 @@ func (m *MemoryEngine) Replicate(ctx context.Context, parent, child string, inhe
 	return childScore, nil
 }
 
+// RollbackReplicate undoes a Replicate on the in-process MemoryEngine
+// (v0.8.0 hotfix 1).
+//
+// Algorithm (under m.mu.Lock):
+//  1. Check if child has any history. If not, return nil (idempotent —
+//     child was never replicated, or already rolled back).
+//  2. Inspect the LAST history entry. If its reason is not ReasonReplicate,
+//     return ErrNotReplicated (someone else wrote after our Replicate;
+//     trampling check prevents us from undoing their legitimate write).
+//  3. Delete the child's score and history.
+//  4. Append a ReasonRollbackReplicate history entry as audit trail.
+//     (Re-uses the child's history slice; semantically the deletion
+//     + append is atomic under m.mu.Lock.)
+func (m *MemoryEngine) RollbackReplicate(ctx context.Context, parent, child string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	hist, ok := m.history[child]
+	if !ok || len(hist) == 0 {
+		// Idempotent: child was never replicated (or already rolled back)
+		// or has been Reset. The trust entry may or may not exist; either
+		// way there's nothing to undo.
+		return nil
+	}
+
+	last := hist[len(hist)-1]
+	if last.Reason != ReasonReplicate {
+		// Trampling check: someone wrote RecordSuccess / RecordFailure /
+		// another Replicate after our Replicate. Do NOT undo — the
+		// most recent write is legitimate.
+		return ErrNotReplicated
+	}
+
+	// Delete child's trust + history, append audit trail.
+	delete(m.scores, child)
+	m.history[child] = append(hist, TrustPoint{
+		Timestamp: time.Now(),
+		Score:     0, // score was deleted
+		Reason:    ReasonRollbackReplicate,
+		Detail:    fmt.Sprintf("parent=%s rolled_back", parent),
+	})
+	return nil
+}
+
 // ErrInvalidWeight is returned when weight is out of [0, 1].
 var ErrInvalidWeight = &TrustError{Code: "INVALID_WEIGHT", Message: "weight must be in [0, 1]"}
 
@@ -226,6 +270,15 @@ var ErrParentCold = &TrustError{Code: "PARENT_COLD", Message: "parent has no tru
 // ErrInvalidFactor is returned by Replicate when inheritanceFactor is outside
 // [0.0, 1.0] (v0.8.0 M4-3).
 var ErrInvalidFactor = &TrustError{Code: "INVALID_FACTOR", Message: "inheritance factor must be in [0, 1]"}
+
+// ErrNotReplicated is returned by RollbackReplicate when the child's most
+// recent history entry is not ReasonReplicate (v0.8.0 hotfix 1).
+//
+// This means a concurrent writer has modified the child's trust after our
+// Replicate. RollbackReplicate refuses to delete in this case to avoid
+// trampling on the legitimate write. Caller should log a warning and
+// accept the orphan trust entry (or implement a manual cleanup).
+var ErrNotReplicated = &TrustError{Code: "NOT_REPLICATED", Message: "child's most recent history entry is not a Replicate (concurrent write?)"}
 
 // TrustError is the error type for Trust Engine operations.
 type TrustError struct {

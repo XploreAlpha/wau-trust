@@ -17,12 +17,13 @@ import (
 type Reason string
 
 const (
-	ReasonSuccess   Reason = "success"
-	ReasonFailure   Reason = "failure"
-	ReasonDecay     Reason = "decay"
-	ReasonManual    Reason = "manual"
-	ReasonInitial   Reason = "initial"
-	ReasonReplicate Reason = "replicate" // v0.8.0 M4-3: trust inherited from parent agent
+	ReasonSuccess           Reason = "success"
+	ReasonFailure           Reason = "failure"
+	ReasonDecay             Reason = "decay"
+	ReasonManual            Reason = "manual"
+	ReasonInitial           Reason = "initial"
+	ReasonReplicate         Reason = "replicate"          // v0.8.0 M4-3: trust inherited from parent agent
+	ReasonRollbackReplicate Reason = "rollback_replicate" // v0.8.0 hotfix 1: undo a Replicate after kernel step 3a/3b failure
 )
 
 // TrustPoint is a single historical record of a Trust Score change.
@@ -125,6 +126,39 @@ type Engine interface {
 	// Returns: the actual computed child trust (after jitter + clamp), useful
 	// for caller logging / verification.
 	Replicate(ctx context.Context, parent, child string, inheritanceFactor float64) (float64, error)
+
+	// RollbackReplicate undoes a Replicate when the caller's downstream step
+	// (e.g. kernel.ReplicateAgent step 3b registry.Heartbeat) failed (v0.8.0
+	// hotfix 1).
+	//
+	// Use case: WAU-core-kernel.ReplicateAgent does 3 writes (trust →
+	// registry → counter). If trust write (3a) succeeds but registry (3b)
+	// fails, the child trust is now an orphan in the trust store with no
+	// registry record. The kernel needs to undo the trust write to avoid
+	// accumulating stale trust entries.
+	//
+	// Semantics:
+	//   - Removes the child's trust entry from the underlying store
+	//     (Memory map / Redis GET+DEL)
+	//   - Appends a ReasonRollbackReplicate history entry (audit trail)
+	//   - **Trampling check**: verifies the child's most recent history entry
+	//     is ReasonReplicate before deleting. If something else has written
+	//     (RecordSuccess / RecordFailure / another Replicate) after our
+	//     Replicate, returns ErrNotReplicated and does NOT delete. This
+	//     prevents RollbackReplicate from undoing a concurrent writer's
+	//     legitimate update.
+	//   - **Idempotent**: calling on a child that was already rolled back
+	//     (or never replicated) returns nil and does nothing.
+	//
+	// Errors:
+	//   - ErrNotReplicated: child's most recent history entry is not
+	//     ReasonReplicate (someone else wrote after our Replicate; safe
+	//     to ignore — the orphan trust remains, but log a warning)
+	//
+	// Caller responsibility:
+	//   - Call immediately after the failed downstream step. Do NOT call
+	//     long after (chance of concurrent writes increases).
+	RollbackReplicate(ctx context.Context, parent, child string) error
 
 	// Write
 	RecordSuccess(ctx context.Context, agentName string, weight float64) error

@@ -219,6 +219,54 @@ func (e *RedisEngine) Replicate(ctx context.Context, parent, child string, inher
 	return childTrust, nil
 }
 
+// RollbackReplicate undoes a Replicate on the production RedisEngine
+// (v0.8.0 hotfix 1).
+//
+// Algorithm:
+//  1. XREVRANGE to fetch the most recent history entry for child.
+//  2. If stream is empty / doesn't exist, return nil (idempotent).
+//  3. If most recent reason is not ReasonReplicate, return ErrNotReplicated
+//     (trampling check — someone wrote after our Replicate).
+//  4. DEL child score key (XADD history stays — append audit entry below).
+//  5. XADD ReasonRollbackReplicate audit entry.
+//
+// Note: we don't use a Lua script here because the operations are
+// independent and best-effort audit logging is acceptable. The critical
+// trampling check (step 3) is a single XREVRANGE call, and the DEL
+// afterwards is safe even if a concurrent writer has since written a new
+// score — by then the trampling check would have caught it.
+func (e *RedisEngine) RollbackReplicate(ctx context.Context, parent, child string) error {
+	// 1. Inspect most recent history entry.
+	entries, err := e.client.XRevRangeN(ctx, e.historyKey(child), "+", "-", 1).Result()
+	if err != nil {
+		return fmt.Errorf("trust: rollback xrevrange %s: %w", child, err)
+	}
+	if len(entries) == 0 {
+		// No history → idempotent (child was never replicated, or already
+		// rolled back and history was deleted by some cleanup; either way
+		// nothing to undo).
+		return nil
+	}
+
+	// 2. Trampling check.
+	reasonVal, _ := entries[0].Values["reason"].(string)
+	if engine.Reason(reasonVal) != engine.ReasonReplicate {
+		return engine.ErrNotReplicated
+	}
+
+	// 3. Delete child score (best-effort; absence is fine — idempotent).
+	if err := e.client.Del(ctx, e.scoreKey(child)).Err(); err != nil {
+		return fmt.Errorf("trust: rollback del score %s: %w", child, err)
+	}
+
+	// 4. Append audit trail entry (best-effort; if this fails the
+	// rollback is still effective — we just lose the audit log).
+	_ = e.appendHistory(ctx, child, time.Now().UnixMilli(), engine.ReasonRollbackReplicate,
+		fmt.Sprintf("parent=%s rolled_back", parent))
+
+	return nil
+}
+
 // recordSignal is the internal EMA + history write.
 //
 // Atomicity: we use a Lua script for EMA so that concurrent

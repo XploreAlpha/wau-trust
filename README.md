@@ -136,5 +136,38 @@ W2(2026-06-21 ~ 06-27)待启动:
 
 ---
 
-**维护者:** Claude + youhaoxi
+## v0.9.0 "Acorn" 收口段(2026-09-15 GA)
+
+上文详细介绍了 trust 握手 / 证书体系 + WAU-core-kernel 历史子目录迁移计划。本段为 v0.9.0 GA 增量补充。
+
+### 角色
+
+| OS 类比 | Authentication Module(认证模块)|
+|---|---|
+| 部署 | 独立 git 仓 = `wau-trust`,WAU-core-kernel 6 子模块之一 |
+| 通信 | gRPC 接收 token 验证请求(由 WAU-core-kernel 转)|
+| 状态 | v0.8.0 GA 已发(2026-07-13)|
+
+### v0.9.0 集成
+
+- **作为 gateway** 在 WAU-core-kernel 前面:所有外部调用都过 wau-trust 验签
+- **JWT / API Key** 二选一(per wau-edge §2.2):同密钥在 wau-trust 侧颁发
+- **证书轮换(per D17)**:v0.9.0 增加自动 7d 轮换
+
+### v0.9.0 "Acorn" 5 份核心文档
+
+| # | 文件 | 内容 |
+|---|---|---|
+| 1 | [README.md](README.md)(本文件)| 仓入口 + 握手历史 + v0.9.0 收口段 |
+| 2 | [QUICKSTART.md](QUICKSTART.md) | 15 分钟跑通签发 + 验证 |
+| 3 | [DEPLOY.md](DEPLOY.md) | 部署 + 密钥管理 + 证书轮换 |
+| 4 | [ARCHITECTURE.md](ARCHITECTURE.md) | token / cert 体系 + 验证流 |
+| 5 | [CHANGELOG.md](CHANGELOG.md) | v0.8.0 + v0.9.0 倒序 |
+
+### 历史锚点
+
+- v0.8.0 GA([[project-v0.8.0-GA-2026-07-13]])
+- D17 拍板(per [[project-v0-9-0-D9-D13-decisions-2026-06-27]])
+
+## License
 **License:** MIT

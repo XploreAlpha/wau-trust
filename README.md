@@ -171,3 +171,51 @@ W2(2026-06-21 ~ 06-27)待启动:
 
 ## License
 **License:** MIT
+
+
+---
+
+## Quickstart(5 节标准节 · W3.5)
+
+> **本节由 W3.5 README 标准化自动 append,2026-07-13**。D60 additive:0 改 README 老内容。
+
+### Install
+
+```bash
+# Go module
+go get github.com/wau/wau-trust
+
+# 或 clone + 手动 build
+git clone https://github.com/XploreAlpha/wau-trust.git
+cd wau-trust
+go build ./...
+```
+
+### Quickstart(5 分钟跑通)
+
+```bash
+# 1. 跑测试(全量)
+go test ./...
+
+# 2. 跑 self-test(若有 cmd/wau-trust/selftest)
+go run ./cmd/wau-trust selftest
+
+# 3. 跑 lint
+go vet ./...
+test -z "$(gofmt -l .)" && echo "fmt OK" || (echo "fmt diff:"; gofmt -l .; exit 1)
+```
+
+### Docs / 关联链接
+
+- [CHANGELOG.md](./CHANGELOG.md) — 版本变更历史
+- [RELEASING.md](./RELEASING.md) — 发版流程(W3.4 新增)
+- [LICENSE](./LICENSE) — MIT
+- [GitHub Actions CI](.github/workflows/ci.yml) — CI 流水线(若有)
+- [WAU 仓列表](https://github.com/XploreAlpha) — 跨仓导航
+- [WAU Whitepaper](https://github.com/XploreAlpha/WAU-core-kernel) — 项目治理
+
+### Status
+
+- **v0.9.0 "Acorn" GA**(2026-07-02)✅
+- **v1.0.0 "Phoenix" GA**(W15 2026-11-22 目标)🔲
+- 公开契约 D60 additive:0 改 / 0 删 / 0 重命名
